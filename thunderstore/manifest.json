@@ -1,0 +1,7 @@
+{
+  "name": "ReSkate_RevertBoost",
+  "version_number": "0.0.0",
+  "website_url": "https://github.com/Sivaes/reverboost",
+  "description": "Auto revert speed boost for ReSkate: land an unfinished spin to gain speed and chain reverts to build it. Slider and toggle in Insert > Skater > BOOSTS. Offline use. Self-updating. One-click Install.bat.",
+  "dependencies": []
+}
