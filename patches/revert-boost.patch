@@ -1,5 +1,5 @@
 diff --git a/Extension/Skater/client_debug.cpp b/Extension/Skater/client_debug.cpp
-index db209dc..3113992 100644
+index db209dc..df9ce39 100644
 --- a/Extension/Skater/client_debug.cpp
 +++ b/Extension/Skater/client_debug.cpp
 @@ -7,10 +7,13 @@
@@ -16,7 +16,7 @@ index db209dc..3113992 100644
  #include <optional>
  #include <utility>
  
-@@ -60,6 +63,87 @@ std::array<float, 3> debug_position(SourceReader& reader, std::uintptr_t address
+@@ -60,6 +63,98 @@ std::array<float, 3> debug_position(SourceReader& reader, std::uintptr_t address
      return {row[0], row[1], row[2]};
  }
  }
@@ -34,6 +34,14 @@ index db209dc..3113992 100644
 +constexpr float revert_min_spin = 90.0f;         // degrees the skater turned in the air
 +constexpr float revert_min_board_offset = 40.0f; // board out of line with the body (forward or fakie) at touchdown
 +constexpr float revert_max_speed = 40.0f;        // m/s (144 km/h): no boost above this
++// Boost size: a share of the current speed that rises smoothly with how far the board turned
++// relative to the body over the flight (board spin minus body spin), times the strength slider.
++constexpr float revert_ramp_start = 40.0f, revert_ramp_end = 360.0f;     // degrees of board rotation
++constexpr float revert_ramp_low = 0.02f, revert_ramp_high = 0.04f;       // share of speed at each end
++float revert_boost_share(float board_rotation) {
++    const float t = std::clamp((board_rotation - revert_ramp_start) / (revert_ramp_end - revert_ramp_start), 0.0f, 1.0f);
++    return revert_ramp_low + (revert_ramp_high - revert_ramp_low) * t;
++}
 +constexpr std::uint64_t revert_min_air_ms = 250, revert_max_age_ms = 400;
 +std::uintptr_t revert_transform_address(std::uintptr_t entity) {
 +    // The same matrix debug_skater reads (the skater's world transform).
@@ -79,13 +87,16 @@ index db209dc..3113992 100644
 +    const bool revert = landing.board_valid && spin_degrees >= revert_min_spin && board_offset >= revert_min_board_offset;
 +    const bool fresh = now >= landing.landed_at && now - landing.landed_at <= revert_max_age_ms;
 +    const float speed = std::hypot(velocity[0], velocity[2]);
++    const float board_rotation = landing.board_valid ? std::abs(landing.board_spin_degrees - landing.spin_degrees) : 0.0f;
++    const float share = revert_boost_share(board_rotation) * debug.revert_boost_speed;
++    const float added = std::isfinite(speed) ? std::min(speed * share, std::max(0.0f, revert_max_speed - speed)) : 0.0f;
 +    const bool allowed = ready && session_boosts_allowed() &&
 +        source_state().velocity_guard_active.load(std::memory_order_acquire) &&
 +        !debug.noclip && !debug.park_editor && !bodies.offboard && !debug.forward_velocity.valid;
 +    const bool fire = allowed && on_ground && revert && fresh && landing.air_ms >= revert_min_air_ms &&
-+        now >= track.cooldown_until && std::isfinite(speed) && speed >= 1.0f && speed <= revert_max_speed;
++        now >= track.cooldown_until && std::isfinite(speed) && speed >= 1.0f && speed <= revert_max_speed && added > 0.0f;
 +    if (fire) {
-+        const float scale = debug.revert_boost_speed / speed;
++        const float scale = added / speed;
 +        const std::array<float, 3> delta{velocity[0] * scale, 0.0f, velocity[2] * scale};
 +        debug.forward_velocity = {client, entity, bodies.core, now + 1000, delta, true};
 +        track.cooldown_until = now + 500;
@@ -93,18 +104,18 @@ index db209dc..3113992 100644
 +    }
 +    if (spin_degrees >= 30.0f)
 +        logging::log(logging::Level::info, logging::Channel::skater,
-+            "Revert Boost: landed after {} ms ({} steps), spin {:.0f} deg, board {} off the body, state {}>{}, {:.1f} m/s{}",
++            "Revert Boost: landed after {} ms ({} steps), spin {:.0f} deg, board {} off the body, board turned {:.0f} deg past the body, state {}>{}, {:.1f} m/s{}",
 +            landing.air_ms, landing.steps, spin_degrees,
 +            landing.board_valid ? std::format("{:.0f} deg", board_offset) : std::string("n/a"),
-+            landing.from, landing.to, speed,
-+            fire ? ", BOOST" : !revert ? "" : !allowed ? ", off" : !on_ground ? ", no boost (not riding)" :
-+            !fresh ? ", no boost (late)" : ", no boost (short flight / cooldown / speed)");
++            board_rotation, landing.from, landing.to, speed,
++            fire ? std::format(", BOOST +{:.1f}% (+{:.2f} m/s)", share * 100.0f, added) : std::string(!revert ? "" : !allowed ? ", off" : !on_ground ? ", no boost (not riding)" :
++            !fresh ? ", no boost (late)" : ", no boost (short flight / cooldown / speed)"));
 +}
 +}
  std::array<float, 16> debug_skater(std::uintptr_t base, std::uintptr_t client, overlay::DebugModel& model) {
      SourceReader reader;
      source_require(reader.pointer(client) == base + addr::engine::client_vtable, "Client changed.");
-@@ -433,6 +517,22 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
+@@ -433,6 +528,22 @@ void debug_action(SourceTrial& trial, std::uintptr_t client, bool can_control, b
          debug.status = up ? "Up Boost speed updated." : "Forward Boost speed updated.";
          return;
      }
@@ -119,15 +130,15 @@ index db209dc..3113992 100644
 +    }
 +    if (request.action == overlay::DebugAction::set_revert_boost_speed) {
 +        source_require(std::isfinite(request.value) && request.value >= 0.5f && request.value <= 15.0f,
-+            "Revert Boost speed must be between 0.5 and 15.");
++            "Revert Boost strength must be between 0.5 and 15.");
 +        debug.revert_boost_speed = request.value;
-+        debug.status = "Revert Boost speed updated.";
++        debug.status = "Revert Boost strength updated.";
 +        return;
 +    }
      if (request.action == overlay::DebugAction::restore_debug) {
          if (debug.save_pending) save_debug(debug);
          debug.first_person_settings = {};
-@@ -798,6 +898,8 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
+@@ -798,6 +909,8 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
          } else if (debug.up_velocity.valid) {
              model.up_velocity_unavailable = "Up Boost is being applied.";
          }
@@ -136,7 +147,7 @@ index db209dc..3113992 100644
          model.no_bail_available = can_control && update_no_bail(client, model.skater_identity, debug.no_bail && no_bail_allowed,
              debug.noclip && debug.noclip_velocity.valid, debug.noclip_velocity.expires);
          if (model.camera_available) {
-@@ -848,6 +950,9 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
+@@ -848,6 +961,9 @@ overlay::DebugModel on_client_debug_tick(std::uintptr_t base, std::uintptr_t cli
      model.forward_velocity_updates = debug.forward_velocity_updates;
      model.up_velocity_speed = debug.up_velocity_speed;
      model.up_velocity_updates = debug.up_velocity_updates;
@@ -147,7 +158,7 @@ index db209dc..3113992 100644
  }
  bool restore_client_debug(std::uintptr_t base, std::uintptr_t client, bool camera_phase_observed) {
 diff --git a/Extension/Skater/client_source_spawn_internal.h b/Extension/Skater/client_source_spawn_internal.h
-index a1efea7..f221d3c 100644
+index a1efea7..3be6e72 100644
 --- a/Extension/Skater/client_source_spawn_internal.h
 +++ b/Extension/Skater/client_source_spawn_internal.h
 @@ -131,6 +131,15 @@ struct InteractiveDebug {
@@ -156,7 +167,7 @@ index a1efea7..f221d3c 100644
      float up_velocity_speed = 20.0f;
 +    // Revert Boost (see revert_boost_tick in client_debug.cpp).
 +    bool revert_boost{};
-+    float revert_boost_speed = 2.0f; // metres per second added along the direction of travel
++    float revert_boost_speed = 1.0f; // strength: 1 = 2% of speed at 40 degrees of board rotation, rising to 4% at 360
 +    std::uint64_t revert_boost_count{};
 +    struct RevertTrack {
 +        bool primed{};                  // the landing count has been read once since Revert Boost was turned on
@@ -328,7 +339,7 @@ index 910da1f..d84aff6 100644
 +RevertLanding last_revert_landing() noexcept;
  }
 diff --git a/Extension/UI/Overlay/overlay.h b/Extension/UI/Overlay/overlay.h
-index 3c3b5b8..efa8987 100644
+index 3c3b5b8..5d1de37 100644
 --- a/Extension/UI/Overlay/overlay.h
 +++ b/Extension/UI/Overlay/overlay.h
 @@ -67,6 +67,8 @@ enum class DebugAction {
@@ -344,9 +355,9 @@ index 3c3b5b8..efa8987 100644
      float camera_speed = 15.0f;
      float forward_velocity_speed = 20.0f;
      float up_velocity_speed = 20.0f;
-+    // Revert Boost: a forward speed added when an unfinished spin is landed (an auto revert).
++    // Revert Boost: a forward speed added when the game auto reverts a landing.
 +    bool revert_boost = false;
-+    float revert_boost_speed = 2.0f;
++    float revert_boost_speed = 1.0f; // strength multiplier
 +    std::uint64_t revert_boost_count = 0;
      bool camera_position_valid = false;
      bool skater_position_valid = false;
@@ -369,20 +380,20 @@ index c2c3b48..1d06744 100644
      std::lock_guard lock(notices_mutex);
      if (notices.empty()) return;
 diff --git a/Extension/UI/Overlay/skate_menu_skater.cpp b/Extension/UI/Overlay/skate_menu_skater.cpp
-index 6c6e7d1..be13104 100644
+index 6c6e7d1..4816088 100644
 --- a/Extension/UI/Overlay/skate_menu_skater.cpp
 +++ b/Extension/UI/Overlay/skate_menu_skater.cpp
 @@ -126,7 +126,15 @@ void movement_controls(SkateMenu& menu, const Model& model, const CallbacksV3& c
      float up_velocity = debug.up_velocity_speed;
      if (ImGui::SliderFloat("##up-velocity", &up_velocity, 1.0f, 25.0f, "+%.1f", ImGuiSliderFlags_AlwaysClamp))
          debug_request(menu, callbacks, {DebugAction::set_up_velocity_speed, false, up_velocity});
-+    field(menu, "Revert boost");
++    field(menu, "Revert boost strength");
 +    float revert_speed = debug.revert_boost_speed;
-+    if (ImGui::SliderFloat("##revert-boost-speed", &revert_speed, 0.5f, 15.0f, "+%.1f m/s", ImGuiSliderFlags_AlwaysClamp))
++    if (ImGui::SliderFloat("##revert-boost-speed", &revert_speed, 0.5f, 15.0f, "x%.1f", ImGuiSliderFlags_AlwaysClamp))
 +        debug_request(menu, callbacks, {DebugAction::set_revert_boost_speed, false, revert_speed});
      ImGui::EndDisabled();
 +    bool revert_boost = debug.revert_boost;
-+    if (toggle_row(menu, "Revert Boost", "Adds the speed above each time the game auto reverts your landing. Clean and short 180s get nothing. Chain reverts to build speed.",
++    if (toggle_row(menu, "Revert Boost", "Each time the game auto reverts your landing, adds 2% of your speed, rising smoothly to 4% the more the board turned past your body (40 to 360 degrees), times the strength above. Clean and short 180s get nothing.",
 +            revert_boost, callbacks.queue_debug != nullptr))
 +        debug_request(menu, callbacks, {DebugAction::set_revert_boost_enabled, revert_boost});
      note("Controller: left stick moves, right stick looks, RT / LT rise and fall, click the left stick to boost.");
